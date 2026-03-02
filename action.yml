@@ -1,0 +1,136 @@
+name: 'Setup Takumi Guard npm Registry'
+description: 'Authenticate to the Takumi byGMO Guard npm registry via OIDC. Works with npm, pnpm, and yarn.'
+author: 'GMO Flatt Security Inc.'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  bot-id:
+    description: 'Bot ID from Shisho Cloud byGMO console. Omit for anonymous mode (Tier A blocking only).'
+    required: false
+    default: ''
+  sts-url:
+    description: 'STS service URL'
+    required: false
+    default: 'https://sts.cloud.shisho.dev'
+  registry-url:
+    description: 'npm registry URL'
+    required: false
+    default: 'https://npm.flatt.tech'
+  expires-in:
+    description: 'Token expiration in seconds (max 86400)'
+    required: false
+    default: '1800'
+  set-registry:
+    description: 'Set the registry URL in .npmrc. Set to false if you manage the registry yourself.'
+    required: false
+    default: 'true'
+
+outputs:
+  token-expires-at:
+    description: 'ISO 8601 timestamp when the token expires'
+    value: ${{ steps.set-outputs.outputs.token-expires-at }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure registry
+      shell: bash
+      env:
+        REGISTRY_URL: ${{ inputs.registry-url }}
+        SET_REGISTRY: ${{ inputs.set-registry }}
+      run: |
+        if [ "$SET_REGISTRY" != "false" ]; then
+          npm config set registry "${REGISTRY_URL}/" --location=project
+          echo "::notice::Registry set to ${REGISTRY_URL}"
+        fi
+
+    - name: Authenticate
+      id: auth
+      shell: bash
+      env:
+        BOT_ID: ${{ inputs.bot-id }}
+        STS_URL: ${{ inputs.sts-url }}
+        REGISTRY_URL: ${{ inputs.registry-url }}
+        EXPIRES_IN: ${{ inputs.expires-in }}
+        SET_REGISTRY: ${{ inputs.set-registry }}
+      run: |
+        # Anonymous mode — no bot-id provided
+        if [ -z "$BOT_ID" ]; then
+          echo "::notice::No bot-id provided — running in anonymous mode (Tier A blocking)"
+          exit 0
+        fi
+
+        # Get OIDC token
+        if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+          MSG="OIDC not available. Add 'permissions: { id-token: write }' to your job."
+          if [ "$SET_REGISTRY" = "false" ]; then
+            echo "::error::${MSG}"
+            exit 1
+          else
+            echo "::error::${MSG} Falling back to anonymous mode (Tier A). Logging integrity is compromised."
+            exit 0
+          fi
+        fi
+
+        OIDC_TOKEN=$(curl -sS -f \
+          -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm.flatt.tech" \
+          | jq -r '.value' 2>/dev/null) || true
+
+        if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+          MSG="Failed to get OIDC token."
+          if [ "$SET_REGISTRY" = "false" ]; then
+            echo "::error::${MSG} No registry fallback available."
+            exit 1
+          else
+            echo "::error::${MSG} Falling back to anonymous mode (Tier A). Logging integrity is compromised."
+            exit 0
+          fi
+        fi
+
+        echo "::add-mask::${OIDC_TOKEN}"
+
+        # Exchange for STS access token
+        RESPONSE=$(curl -sS -X POST "${STS_URL}/bots/exchange" \
+          -H "Content-Type: application/json" \
+          -d "{\"bot_id\": \"${BOT_ID}\", \"id_token\": \"${OIDC_TOKEN}\", \"expires_in\": ${EXPIRES_IN}}" 2>/dev/null) || true
+
+        ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token' 2>/dev/null)
+        EXPIRES_IN_ACTUAL=$(echo "$RESPONSE" | jq -r '.expires_in' 2>/dev/null)
+
+        if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+          ERROR_MSG=$(echo "$RESPONSE" | jq -r '.message // "Unknown error"' 2>/dev/null)
+          MSG="Authentication failed: ${ERROR_MSG}"
+          if [ "$SET_REGISTRY" = "false" ]; then
+            echo "::error::${MSG} No registry fallback available."
+            exit 1
+          else
+            echo "::error::${MSG} Falling back to anonymous mode (Tier A). Logging integrity is compromised."
+            exit 0
+          fi
+        fi
+
+        echo "::add-mask::${ACCESS_TOKEN}"
+
+        REGISTRY_HOST=$(echo "$REGISTRY_URL" | sed 's|^https://||' | sed 's|/$||')
+        npm config set "//${REGISTRY_HOST}/:_authToken" "${ACCESS_TOKEN}" --location=project
+
+        # Calculate expiration timestamp (Linux date -d, macOS date -v fallback)
+        EXPIRES_AT=$(date -u -d "+${EXPIRES_IN_ACTUAL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+                     date -u -v+"${EXPIRES_IN_ACTUAL}"S +%Y-%m-%dT%H:%M:%SZ)
+        echo "expires_at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
+
+        echo "::notice::Authenticated as bot ${BOT_ID} (Tier C)"
+
+    - name: Set outputs
+      id: set-outputs
+      shell: bash
+      env:
+        EXPIRES_AT: ${{ steps.auth.outputs.expires_at }}
+      run: |
+        if [ -n "$EXPIRES_AT" ]; then
+          echo "token-expires-at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
+        fi
