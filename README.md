@@ -16,6 +16,8 @@
 
 ---
 
+> **Not using CI?** For local setup on your laptop, see the [email registration & token management appendix](#appendix-email-registration--token-management) below.
+
 ## Contents
 
 - [What is Takumi Guard?](#what-is-takumi-guard)
@@ -320,6 +322,8 @@ curl -X DELETE -H "Authorization: Bearer tg_anon_xxx..." \
 ```
 
 Revoking a token stops future breach notifications and removes the email association. You can register again at any time.
+
+> **For a complete walkthrough**, see the [Takumi Guard quickstart guide](https://shisho.dev/docs/t/guard/quickstart/npm#setup-anonymous).
 
 ---
 
