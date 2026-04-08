@@ -29,6 +29,12 @@ inputs:
     default: 'true'
 
 outputs:
+  registry-url:
+    description: 'The npm registry URL'
+    value: ${{ steps.set-outputs.outputs.registry-url }}
+  token:
+    description: 'The access token for the registry (empty in anonymous mode)'
+    value: ${{ steps.set-outputs.outputs.token }}
   token-expires-at:
     description: 'ISO 8601 timestamp when the token expires'
     value: ${{ steps.set-outputs.outputs.token-expires-at }}
@@ -44,6 +50,7 @@ runs:
       run: |
         if [ "$SET_REGISTRY" != "false" ]; then
           npm config set registry "${REGISTRY_URL}/" --location=project
+          echo "YARN_NPM_REGISTRY_SERVER=${REGISTRY_URL}/" >> "$GITHUB_ENV"
           echo "::notice::Registry set to ${REGISTRY_URL}"
         fi
 
@@ -117,6 +124,8 @@ runs:
 
         REGISTRY_HOST=$(echo "$REGISTRY_URL" | sed 's|^https://||' | sed 's|/$||')
         npm config set "//${REGISTRY_HOST}/:_authToken" "${ACCESS_TOKEN}" --location=project
+        echo "YARN_NPM_AUTH_TOKEN=${ACCESS_TOKEN}" >> "$GITHUB_ENV"
+        echo "token=${ACCESS_TOKEN}" >> "$GITHUB_OUTPUT"
 
         # Calculate expiration timestamp (Linux date -d, macOS date -v fallback)
         EXPIRES_AT=$(date -u -d "+${EXPIRES_IN_ACTUAL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
@@ -129,8 +138,15 @@ runs:
       id: set-outputs
       shell: bash
       env:
+        REGISTRY_URL: ${{ inputs.registry-url }}
+        ACCESS_TOKEN: ${{ steps.auth.outputs.token }}
         EXPIRES_AT: ${{ steps.auth.outputs.expires_at }}
       run: |
+        echo "registry-url=${REGISTRY_URL}" >> "$GITHUB_OUTPUT"
+        if [ -n "$ACCESS_TOKEN" ]; then
+          echo "::add-mask::${ACCESS_TOKEN}"
+          echo "token=${ACCESS_TOKEN}" >> "$GITHUB_OUTPUT"
+        fi
         if [ -n "$EXPIRES_AT" ]; then
           echo "token-expires-at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
         fi

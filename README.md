@@ -39,7 +39,7 @@ Every `npm install` in your CI is a trust decision. Takumi Guard sits between yo
 
 - **How it works** -- Routes installs through a security proxy (`npm.flatt.tech`) that checks packages against a threat database in real time.
 - **What you change** -- One step in your workflow YAML. No config files, no secrets to manage.
-- **What it supports** -- **npm**, **pnpm**, and **yarn**.
+- **What it supports** -- **npm**, **pnpm**, **Yarn Classic (v1)**, and **Yarn Berry (v2+)**.
 
 ---
 
@@ -234,6 +234,8 @@ git commit -m "Route installs through Takumi Guard"
 
 | Output | Description |
 |---|---|
+| `registry-url` | The npm registry URL. |
+| `token` | The access token for the registry. Empty in anonymous mode. |
 | `token-expires-at` | ISO 8601 timestamp of token expiration. Only set when authenticated. |
 
 ---
@@ -258,7 +260,8 @@ git commit -m "Route installs through Takumi Guard"
 
 - **Short-lived tokens** -- 30 minutes by default, 24 hours max.
 - **Auto-masked** -- Tokens are automatically masked in workflow logs.
-- **Project-scoped** -- The action writes to project-level `.npmrc` only. Your global npm config is untouched.
+- **Project-scoped** -- For npm/pnpm/Yarn v1, the action writes to project-level `.npmrc` only. Your global npm config is untouched.
+- **Yarn Berry** -- For Yarn v2+, the registry URL and auth token are exported as environment variables (`YARN_NPM_REGISTRY_SERVER`, `YARN_NPM_AUTH_TOKEN`) via `$GITHUB_ENV`. These are job-scoped (visible to subsequent steps), but the token is short-lived and auto-masked in logs.
 - **Preserves scoped registries** -- Existing entries (e.g. `@myorg:registry=...`) are not overwritten.
 
 ---
