@@ -48,8 +48,15 @@ runs:
         REGISTRY_URL: ${{ inputs.registry-url }}
         SET_REGISTRY: ${{ inputs.set-registry }}
       run: |
+        # Write to .npmrc directly instead of `npm config set` to avoid
+        # `EBADDEVENGINES` failures when projects pin the package manager
+        # via `devEngines.packageManager` (npm 10.9.0+). See issue #4.
         if [ "$SET_REGISTRY" != "false" ]; then
-          npm config set registry "${REGISTRY_URL}/" --location=project
+          if [ -f .npmrc ]; then
+            grep -v '^registry=' .npmrc > .npmrc.tmp || true
+            mv .npmrc.tmp .npmrc
+          fi
+          echo "registry=${REGISTRY_URL}/" >> .npmrc
           echo "YARN_NPM_REGISTRY_SERVER=${REGISTRY_URL}/" >> "$GITHUB_ENV"
           echo "::notice::Registry set to ${REGISTRY_URL}"
         fi
@@ -123,7 +130,14 @@ runs:
         echo "::add-mask::${ACCESS_TOKEN}"
 
         REGISTRY_HOST=$(echo "$REGISTRY_URL" | sed 's|^https://||' | sed 's|/$||')
-        npm config set "//${REGISTRY_HOST}/:_authToken" "${ACCESS_TOKEN}" --location=project
+        # Write to .npmrc directly instead of `npm config set` to avoid
+        # `EBADDEVENGINES` failures when projects pin the package manager
+        # via `devEngines.packageManager` (npm 10.9.0+). See issue #4.
+        if [ -f .npmrc ]; then
+          grep -v "^//${REGISTRY_HOST}/:_authToken=" .npmrc > .npmrc.tmp || true
+          mv .npmrc.tmp .npmrc
+        fi
+        echo "//${REGISTRY_HOST}/:_authToken=${ACCESS_TOKEN}" >> .npmrc
         echo "YARN_NPM_AUTH_TOKEN=${ACCESS_TOKEN}" >> "$GITHUB_ENV"
         echo "token=${ACCESS_TOKEN}" >> "$GITHUB_OUTPUT"
 
