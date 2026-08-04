@@ -225,8 +225,9 @@ git commit -m "Route installs through Takumi Guard"
 | `bot-id` | No | -- | Bot ID from Shisho Cloud byGMO. Omit for blocking-only mode. |
 | `set-registry` | No | `true` | Set the registry URL in `.npmrc`. Set to `false` if you manage it yourself. |
 | `registry-url` | No | `https://npm.flatt.tech` | Registry endpoint. |
-| `sts-url` | No | `https://sts.shisho.dev` | STS endpoint for token exchange. |
+| `sts-url` | No | `https://sts.cloud.shisho.dev` | STS endpoint for token exchange. |
 | `expires-in` | No | `1800` | Token lifetime in seconds (max 86400). |
+| `audience` | No | `https://sts.cloud.shisho.dev` (the STS URL) | Audience for the OIDC token request. Override when your Bot trust condition expects a different value. |
 
 ---
 
@@ -247,7 +248,7 @@ git commit -m "Route installs through Takumi Guard"
 | Error | Cause | Fix |
 |---|---|---|
 | `OIDC not available` | Missing permission on the job | Add `permissions: { id-token: write }` to your job |
-| `invalid ID token` | Trust condition mismatch | Check the bot's trust settings in Shisho Cloud byGMO |
+| `invalid ID token` | Trust condition mismatch | Check the bot's trust settings in Shisho Cloud byGMO. If your trust condition sets an audience, it must equal the value the action sends -- by default the STS URL (`https://sts.cloud.shisho.dev`); use the `audience` input to override. |
 | `invalid request` | Malformed bot-id | Double-check the bot-id value from your console |
 | `Authentication failed ... Falling back` | STS token exchange failed | Verify bot-id and trust settings. Blocking is still active. |
 | Lockfile conflicts after setup | Lockfile still references `registry.npmjs.org` | Follow the [migration steps](#migrating-existing-projects) to regenerate it |
