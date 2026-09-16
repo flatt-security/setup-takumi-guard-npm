@@ -24,6 +24,7 @@
 - [Quickstart (3 steps)](#quickstart)
 - [Verify it works](#verify-it-works)
 - [Setup modes](#setup-modes)
+- [Installs outside the repository root](#installs-outside-the-repository-root)
 - [Migrating existing projects (3 steps)](#migrating-existing-projects)
 - [Inputs](#inputs)
 - [Outputs](#outputs)
@@ -114,7 +115,7 @@ Pick the mode that fits your situation. Here is how they compare at a glance:
 |---|:---:|:---:|:---:|---|
 | **[Blocking only](#blocking-only)** | Yes | No | No | OSS projects, quick evaluation |
 | **[Full protection](#full-protection)** | Yes | Yes | Yes | Production workloads |
-| **[Auth-only](#auth-only-advanced)** | You manage | Yes | Yes | Monorepos, custom `.npmrc` |
+| **[Auth-only](#auth-only-advanced)** | You manage | Yes | Yes | Custom `.npmrc` |
 
 ---
 
@@ -165,9 +166,59 @@ steps:
 ```
 
 **Key details:**
-- Useful for monorepos or projects that need full control over `.npmrc`.
+- Useful for projects that need full control over `.npmrc`.
 - Requires `registry=https://npm.flatt.tech/` in your committed `.npmrc`.
 - If authentication fails, **the action exits with an error** -- there is no fallback.
+
+---
+
+## Installs outside the repository root
+
+Works with every mode above. By default the action writes `${{ github.workspace }}/.npmrc`, which is the file npm, pnpm and Yarn Classic read when you install at the repository root. If your install reads a different file, use `npmrc-path`: writing the configuration anywhere else leaves the install on the public registry, and unless you use auth-only mode **nothing fails** -- the registry line and the token live in that one file, so both are ignored together and packages are fetched without passing through Takumi Guard.
+
+`npmrc-path` takes a directory (the `.npmrc` is created inside it) or a file path. Relative paths resolve against the workspace.
+
+```yaml
+- uses: flatt-security/setup-takumi-guard-npm@v1
+  with:
+    bot-id: "YOUR_BOT_ID"
+    npmrc-path: infrastructure   # the package.json you install lives here
+```
+
+**Which directory?** With workspaces, the workspace root. Without workspaces, the directory holding the `package.json` you install. The details differ per package manager (measured with npm 10.4.0, pnpm 11.5.0, Yarn 1.22.22 and Yarn 4.18.0):
+
+| Package manager | No workspaces | Workspaces |
+|---|---|---|
+| npm | the directory holding `package.json`; a file at the repository root is **not** read from a subdirectory | the **workspace root**. npm ignores an `.npmrc` inside a workspace package even when the install runs in that package |
+| pnpm | the directory holding `package.json` | the **workspace root**, which is where a workspace install runs from |
+| Yarn Classic (v1) | the directory holding `package.json`; unlike npm it also reads a file at the repository root | the **workspace root**, for the same reason as pnpm |
+| Yarn Berry (v2+) | not applicable -- Berry does not read `.npmrc` | not applicable |
+
+Yarn Berry receives the registry and token through `YARN_NPM_REGISTRY_SERVER` and `YARN_NPM_AUTH_TOKEN` in `$GITHUB_ENV`, which apply to the whole job whatever directory the install runs in. `npmrc-path` has no effect on it.
+
+### Keeping the file out of your working tree
+
+Pass a path **outside** the workspace and the action also exports `NPM_CONFIG_USERCONFIG`, so npm, pnpm and Yarn Classic read it from any directory while your checkout stays untouched. Use this when a workflow commits its own changes -- a tracked `.npmrc` would otherwise be swept into an auto-generated commit -- or when the install happens inside a Docker build:
+
+```yaml
+- uses: flatt-security/setup-takumi-guard-npm@v1
+  with:
+    bot-id: "YOUR_BOT_ID"
+    npmrc-path: ${{ runner.temp }}/takumi-guard/npmrc
+
+- run: docker build --secret id=npmrc,src="$NPM_CONFIG_USERCONFIG" .
+```
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
+```
+
+The secret is mounted for that one `RUN` and never becomes a layer, so the token stays out of the image and out of build args.
+
+**Two things to know about this mode:**
+
+- A committed `.npmrc` containing `registry=` **wins** over it, because project-level configuration takes precedence over user-level. If your repository commits its own registry line, point `npmrc-path` at that file instead.
+- If `NPM_CONFIG_USERCONFIG` is already set -- `actions/setup-node` sets it whenever you give it `registry-url` -- the action stops with an error rather than discarding someone else's file. Pass that same path as `npmrc-path` and the settings are merged into it.
 
 ---
 
@@ -228,6 +279,7 @@ git commit -m "Route installs through Takumi Guard"
 | `sts-url` | No | `https://sts.cloud.shisho.dev` | STS endpoint for token exchange. |
 | `expires-in` | No | `1800` | Token lifetime in seconds (max 86400). |
 | `audience` | No | `https://sts.cloud.shisho.dev` (the STS URL) | Audience for the OIDC token request. Override when your Bot trust condition expects a different value. |
+| `npmrc-path` | No | `${{ github.workspace }}/.npmrc` | Directory or file path to write the `.npmrc` to. See [Installs outside the repository root](#installs-outside-the-repository-root). |
 
 ---
 
@@ -238,6 +290,7 @@ git commit -m "Route installs through Takumi Guard"
 | `registry-url` | The npm registry URL. |
 | `token` | The access token for the registry. Empty in anonymous mode. |
 | `token-expires-at` | ISO 8601 timestamp of token expiration. Only set when authenticated. |
+| `npmrc-path` | Absolute path of the `.npmrc` the action wrote. |
 
 ---
 
@@ -261,7 +314,7 @@ git commit -m "Route installs through Takumi Guard"
 
 - **Short-lived tokens** -- 30 minutes by default, 24 hours max.
 - **Auto-masked** -- Tokens are automatically masked in workflow logs.
-- **Project-scoped** -- For npm/pnpm/Yarn v1, the action writes to project-level `.npmrc` only. Your global npm config is untouched.
+- **Project-scoped** -- For npm/pnpm/Yarn v1, the action writes to project-level `.npmrc` only. Your global npm config is untouched. With `npmrc-path` pointing outside the workspace, it writes that file and exports `NPM_CONFIG_USERCONFIG`; the file is created with `600` permissions and your global config is still untouched.
 - **Yarn Berry** -- For Yarn v2+, the registry URL and auth token are exported as environment variables (`YARN_NPM_REGISTRY_SERVER`, `YARN_NPM_AUTH_TOKEN`) via `$GITHUB_ENV`. These are job-scoped (visible to subsequent steps), but the token is short-lived and auto-masked in logs.
 - **Preserves scoped registries** -- Existing entries (e.g. `@myorg:registry=...`) are not overwritten.
 

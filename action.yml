@@ -31,6 +31,10 @@ inputs:
     description: 'Audience for the OIDC token request. Defaults to the STS URL. Override when your Bot trust condition expects a different value.'
     required: false
     default: ''
+  npmrc-path:
+    description: 'Where to write the .npmrc. A directory (the file is created inside it) or a file path; relative paths resolve against the workspace. Defaults to the workspace root. Point it at the directory your package manager reads project config from — with workspaces that is the workspace root, otherwise the directory holding the package.json you install. A path outside the workspace is exported as NPM_CONFIG_USERCONFIG so every directory reads it and the working tree is left untouched.'
+    required: false
+    default: ''
 
 outputs:
   registry-url:
@@ -42,25 +46,101 @@ outputs:
   token-expires-at:
     description: 'ISO 8601 timestamp when the token expires'
     value: ${{ steps.set-outputs.outputs.token-expires-at }}
+  npmrc-path:
+    description: 'Absolute path of the .npmrc the action wrote'
+    value: ${{ steps.resolve.outputs.path }}
 
 runs:
   using: 'composite'
   steps:
+    - name: Resolve .npmrc path
+      id: resolve
+      shell: bash
+      env:
+        NPMRC_PATH_INPUT: ${{ inputs.npmrc-path }}
+      run: |
+        set -euo pipefail
+
+        WORKSPACE=$(cd "${GITHUB_WORKSPACE:-$PWD}" && pwd -P)
+
+        if [ -z "$NPMRC_PATH_INPUT" ]; then
+          TARGET="${WORKSPACE}/.npmrc"
+        else
+          case "$NPMRC_PATH_INPUT" in
+            /*) TARGET="$NPMRC_PATH_INPUT" ;;
+            *)  TARGET="${WORKSPACE}/${NPMRC_PATH_INPUT}" ;;
+          esac
+          # A directory names the file inside it, because which *directory* the
+          # package manager reads project config from is what callers know.
+          if [ -d "$TARGET" ] || [ "${TARGET%/}" != "$TARGET" ]; then
+            TARGET="${TARGET%/}/.npmrc"
+          fi
+        fi
+
+        mkdir -p "$(dirname "$TARGET")"
+        # Resolve symlinks so the workspace comparison below cannot be fooled
+        # into treating an outside path as inside (the runner's temp directory
+        # is a symlink on some images).
+        TARGET="$(cd "$(dirname "$TARGET")" && pwd -P)/$(basename "$TARGET")"
+
+        case "$TARGET" in
+          "${WORKSPACE}"/*) INSIDE=true ;;
+          *) INSIDE=false ;;
+        esac
+
+        echo "path=${TARGET}" >> "$GITHUB_OUTPUT"
+        echo "inside-workspace=${INSIDE}" >> "$GITHUB_OUTPUT"
+
+        if [ "$INSIDE" = "true" ]; then
+          echo "::notice::Writing npm configuration to ${TARGET}"
+          exit 0
+        fi
+
+        # Outside the workspace the file is not project config for any install,
+        # so npm, pnpm and Yarn Classic only read it through this variable.
+        # Refuse to silently drop a value someone else owns: actions/setup-node
+        # points it at its own file, and overwriting that would discard the
+        # registry and credentials it wrote.
+        EXISTING="${NPM_CONFIG_USERCONFIG:-}"
+        if [ -n "$EXISTING" ] && [ "$EXISTING" != "$TARGET" ]; then
+          echo "::error::NPM_CONFIG_USERCONFIG is already set to ${EXISTING} (actions/setup-node sets it when given registry-url). Pass npmrc-path: ${EXISTING} so this action merges into that file instead of replacing it."
+          exit 1
+        fi
+
+        # The token lands outside the repository, where nothing else narrows the
+        # permissions for us.
+        touch "$TARGET"
+        chmod 600 "$TARGET"
+
+        echo "NPM_CONFIG_USERCONFIG=${TARGET}" >> "$GITHUB_ENV"
+        echo "::notice::Writing npm configuration to ${TARGET} and exporting NPM_CONFIG_USERCONFIG"
+
     - name: Configure registry
       shell: bash
       env:
         REGISTRY_URL: ${{ inputs.registry-url }}
         SET_REGISTRY: ${{ inputs.set-registry }}
+        NPMRC_FILE: ${{ steps.resolve.outputs.path }}
+        NPMRC_INSIDE_WORKSPACE: ${{ steps.resolve.outputs.inside-workspace }}
       run: |
+        # Outside the workspace this file holds the token and nothing else
+        # narrows its permissions, and the rewrite below replaces the file, so
+        # the mode has to be set for every file this step creates -- including
+        # the temporary one. Inside the workspace the file may be tracked by
+        # git, where changing the mode would show up as a diff.
+        if [ "$NPMRC_INSIDE_WORKSPACE" = "false" ]; then
+          umask 077
+        fi
+
         # Write to .npmrc directly instead of `npm config set` to avoid
         # `EBADDEVENGINES` failures when projects pin the package manager
         # via `devEngines.packageManager` (npm 10.9.0+). See issue #4.
         if [ "$SET_REGISTRY" != "false" ]; then
-          if [ -f .npmrc ]; then
-            grep -v '^registry=' .npmrc > .npmrc.tmp || true
-            mv .npmrc.tmp .npmrc
+          if [ -f "$NPMRC_FILE" ]; then
+            grep -v '^registry=' "$NPMRC_FILE" > "${NPMRC_FILE}.tmp" || true
+            mv "${NPMRC_FILE}.tmp" "$NPMRC_FILE"
           fi
-          echo "registry=${REGISTRY_URL}/" >> .npmrc
+          echo "registry=${REGISTRY_URL}/" >> "$NPMRC_FILE"
           echo "YARN_NPM_REGISTRY_SERVER=${REGISTRY_URL}/" >> "$GITHUB_ENV"
           echo "::notice::Registry set to ${REGISTRY_URL}"
         fi
@@ -75,7 +155,15 @@ runs:
         EXPIRES_IN: ${{ inputs.expires-in }}
         SET_REGISTRY: ${{ inputs.set-registry }}
         AUDIENCE_INPUT: ${{ inputs.audience }}
+        NPMRC_FILE: ${{ steps.resolve.outputs.path }}
+        NPMRC_INSIDE_WORKSPACE: ${{ steps.resolve.outputs.inside-workspace }}
       run: |
+        # See the note in `Configure registry`: the rewrite below creates new
+        # files, and this is the step that writes the token into them.
+        if [ "$NPMRC_INSIDE_WORKSPACE" = "false" ]; then
+          umask 077
+        fi
+
         # Anonymous mode — no bot-id provided
         if [ -z "$BOT_ID" ]; then
           echo "::notice::No bot-id provided — running in anonymous mode (Tier A blocking)"
@@ -151,11 +239,11 @@ runs:
         # Write to .npmrc directly instead of `npm config set` to avoid
         # `EBADDEVENGINES` failures when projects pin the package manager
         # via `devEngines.packageManager` (npm 10.9.0+). See issue #4.
-        if [ -f .npmrc ]; then
-          grep -v "^//${REGISTRY_HOST}/:_authToken=" .npmrc > .npmrc.tmp || true
-          mv .npmrc.tmp .npmrc
+        if [ -f "$NPMRC_FILE" ]; then
+          grep -v "^//${REGISTRY_HOST}/:_authToken=" "$NPMRC_FILE" > "${NPMRC_FILE}.tmp" || true
+          mv "${NPMRC_FILE}.tmp" "$NPMRC_FILE"
         fi
-        echo "//${REGISTRY_HOST}/:_authToken=${ACCESS_TOKEN}" >> .npmrc
+        echo "//${REGISTRY_HOST}/:_authToken=${ACCESS_TOKEN}" >> "$NPMRC_FILE"
         echo "YARN_NPM_AUTH_TOKEN=${ACCESS_TOKEN}" >> "$GITHUB_ENV"
         echo "token=${ACCESS_TOKEN}" >> "$GITHUB_OUTPUT"
 

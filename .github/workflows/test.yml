@@ -21,3 +21,202 @@ jobs:
           grep -q 'using:.*composite' action.yml
           grep -q "bot-id:" action.yml
           echo "Required fields present"
+
+  # Every job below runs the action itself (uses: ./). Copying its shell into
+  # the workflow would keep passing even if action.yml stopped wiring the
+  # resolved path into the steps, and that is the regression that matters: an
+  # .npmrc written where the package manager does not read it leaves the
+  # install on the public registry, and outside auth-only mode nothing fails.
+  # Anonymous mode (no bot-id) keeps these free of secrets and OIDC.
+
+  default-path:
+    name: default writes at the workspace root
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+      - name: Assert
+        run: |
+          test -f .npmrc || { echo "::error::root .npmrc is missing"; exit 1; }
+          grep -q '^registry=https://npm.flatt.tech/' .npmrc
+
+  subdirectory:
+    name: package in a subdirectory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Fixture
+        run: |
+          mkdir -p fixture/infrastructure
+          echo '{ "name": "root", "private": true }' > fixture/package.json
+          echo '{ "name": "infra", "version": "1.0.0" }' > fixture/infrastructure/package.json
+
+      - uses: ./
+        with:
+          npmrc-path: fixture/infrastructure
+
+      - name: Assert the file landed there and nowhere else
+        run: |
+          grep -q '^registry=https://npm.flatt.tech/' fixture/infrastructure/.npmrc
+          if [ -f .npmrc ] || [ -f fixture/.npmrc ]; then
+            echo "::error::an .npmrc was written outside the requested directory"; exit 1
+          fi
+
+      - name: Assert npm there resolves the proxy
+        working-directory: fixture/infrastructure
+        run: |
+          ACTUAL=$(npm config get registry)
+          [ "$ACTUAL" = "https://npm.flatt.tech/" ] || { echo "::error::npm resolved ${ACTUAL}"; exit 1; }
+
+      # A file path is accepted as well as a directory, because the requested
+      # input (issue #2, Option B) names the file.
+      - name: Fixture -- explicit file path
+        run: |
+          mkdir -p fixture2/infrastructure
+          echo '{ "name": "infra", "version": "1.0.0" }' > fixture2/infrastructure/package.json
+
+      - uses: ./
+        with:
+          npmrc-path: fixture2/infrastructure/.npmrc
+
+      - name: Assert
+        working-directory: fixture2/infrastructure
+        run: |
+          ACTUAL=$(npm config get registry)
+          [ "$ACTUAL" = "https://npm.flatt.tech/" ] || { echo "::error::npm resolved ${ACTUAL}"; exit 1; }
+
+  workspaces:
+    name: npm workspaces reads the workspace root
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Fixture
+        run: |
+          mkdir -p fixture/packages/a
+          echo '{ "name": "root", "private": true, "workspaces": ["packages/*"] }' > fixture/package.json
+          echo '{ "name": "a", "version": "1.0.0" }' > fixture/packages/a/package.json
+
+      - uses: ./
+        with:
+          npmrc-path: fixture
+
+      - name: Assert the install in a workspace package resolves the proxy
+        working-directory: fixture
+        run: |
+          ACTUAL=$(npm config get registry)
+          [ "$ACTUAL" = "https://npm.flatt.tech/" ] || { echo "::error::npm resolved ${ACTUAL}"; exit 1; }
+          # npm refuses `npm config get` inside a workspace package, so what
+          # proves the root file is in effect is where the install actually
+          # connects. An empty cache keeps npm from answering offline, and
+          # --loglevel=http prints the URL it fetched.
+          npm install --workspace a --package-lock-only --loglevel=http \
+            --cache "${RUNNER_TEMP}/npm-cache-workspaces" left-pad@1.3.0 2>&1 | tee install.log
+          grep -q 'https://npm.flatt.tech/left-pad' install.log || { echo "::error::the install did not fetch through the proxy"; sed -n '1,40p' install.log; exit 1; }
+
+  outside-workspace:
+    name: a path outside the workspace leaves the tree untouched
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Fixture
+        run: |
+          mkdir -p fixture/infrastructure
+          echo '{ "name": "infra", "version": "1.0.0" }' > fixture/infrastructure/package.json
+
+      - uses: ./
+        with:
+          npmrc-path: ${{ runner.temp }}/takumi-guard/npmrc
+
+      - name: Assert the tree is clean and the file is private
+        run: |
+          test -f "${RUNNER_TEMP}/takumi-guard/npmrc" || { echo "::error::the file is missing"; exit 1; }
+          [ "$(stat -c '%a' "${RUNNER_TEMP}/takumi-guard/npmrc")" = "600" ] || { echo "::error::permissions are $(stat -c '%a' "${RUNNER_TEMP}/takumi-guard/npmrc")"; exit 1; }
+          if [ -f .npmrc ]; then echo "::error::the workspace root was written to"; exit 1; fi
+          # The point of this mode: a workflow that commits its own changes
+          # must not pick up npm configuration.
+          UNTRACKED=$(git status --porcelain)
+          [ "$UNTRACKED" = "?? fixture/" ] || { echo "::error::unexpected working tree changes: ${UNTRACKED}"; exit 1; }
+
+      - name: Assert NPM_CONFIG_USERCONFIG carries it into a subdirectory
+        working-directory: fixture/infrastructure
+        run: |
+          [ "$NPM_CONFIG_USERCONFIG" = "${RUNNER_TEMP}/takumi-guard/npmrc" ] || { echo "::error::NPM_CONFIG_USERCONFIG is ${NPM_CONFIG_USERCONFIG}"; exit 1; }
+          ACTUAL=$(npm config get registry)
+          [ "$ACTUAL" = "https://npm.flatt.tech/" ] || { echo "::error::npm resolved ${ACTUAL}"; exit 1; }
+
+  setup-node-coexistence:
+    name: merges into the file actions/setup-node owns
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup-node writes $RUNNER_TEMP/.npmrc and exports NPM_CONFIG_USERCONFIG
+      # when given a registry-url. Replacing that file would drop its settings,
+      # so the documented answer is to point this action at the same file.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          scope: '@example'
+
+      - uses: ./
+        with:
+          npmrc-path: ${{ runner.temp }}/.npmrc
+
+      - name: Assert both sets of settings survive
+        run: |
+          cat "${RUNNER_TEMP}/.npmrc" | sed 's/:_authToken=.*/:_authToken=REDACTED/'
+          grep -q '^registry=https://npm.flatt.tech/' "${RUNNER_TEMP}/.npmrc" || { echo "::error::our registry line is missing"; exit 1; }
+          grep -q '^@example:registry=' "${RUNNER_TEMP}/.npmrc" || { echo "::error::the scoped registry setup-node wrote was lost"; exit 1; }
+
+  dockerfile-secret:
+    name: the file can be handed to docker build --secret
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./
+        with:
+          npmrc-path: ${{ runner.temp }}/takumi-guard/npmrc
+
+      - name: Fixture
+        run: |
+          mkdir -p docker-fixture
+          cat > docker-fixture/Dockerfile <<'EOF'
+          FROM node:22-alpine
+          WORKDIR /app
+          # --loglevel=http prints the URL npm fetched from, which is the only
+          # thing that distinguishes a mounted config that took effect from one
+          # npm never read: a successful install proves nothing, because the
+          # public registry serves the same package.
+          RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
+              npm install --no-package-lock --loglevel=http left-pad@1.3.0
+          EOF
+
+      # The install inside the container only reaches npm.flatt.tech if the
+      # mounted file is the one npm reads, and the secret never becomes a layer.
+      - name: Build with the npmrc as a build secret
+        run: |
+          docker build \
+            --secret id=npmrc,src="$NPM_CONFIG_USERCONFIG" \
+            --progress=plain \
+            -t guard-secret-test docker-fixture 2>&1 | tee build.log
+          grep -q 'https://npm.flatt.tech/left-pad' build.log || { echo "::error::the install inside the container did not fetch through the proxy"; exit 1; }
+
+      - name: Assert the secret is not in the image
+        run: |
+          if docker run --rm guard-secret-test sh -c 'test -f /root/.npmrc'; then
+            echo "::error::the npmrc survived into the image"; exit 1
+          fi
