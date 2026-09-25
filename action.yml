@@ -1,5 +1,5 @@
 name: 'Setup Takumi Guard npm Registry'
-description: 'Authenticate to the Takumi byGMO Guard npm registry via OIDC. Works with npm, pnpm, and yarn.'
+description: 'Authenticate to the Takumi byGMO Guard npm registry via OIDC. Works with npm, pnpm, yarn, and bun.'
 author: 'GMO Flatt Security Inc.'
 
 branding:
@@ -24,9 +24,13 @@ inputs:
     required: false
     default: '1800'
   set-registry:
-    description: 'Set the registry URL in .npmrc. Set to false if you manage the registry yourself.'
+    description: 'Set the registry URL. Set to false if you manage the registry yourself.'
     required: false
     default: 'true'
+  always-auth:
+    description: 'Also send the token for unscoped packages with Yarn Classic. npm 11 and later warn about this setting on every command.'
+    required: false
+    default: 'false'
   audience:
     description: 'Audience for the OIDC token request. Defaults to the STS URL. Override when your Bot trust condition expects a different value.'
     required: false
@@ -42,6 +46,9 @@ outputs:
   token-expires-at:
     description: 'ISO 8601 timestamp when the token expires'
     value: ${{ steps.set-outputs.outputs.token-expires-at }}
+  npmrc-path:
+    description: 'Absolute path of the .npmrc this action wrote'
+    value: ${{ steps.set-outputs.outputs.npmrc-path }}
 
 runs:
   using: 'composite'
@@ -52,17 +59,48 @@ runs:
         REGISTRY_URL: ${{ inputs.registry-url }}
         SET_REGISTRY: ${{ inputs.set-registry }}
       run: |
+        # Write the configuration to a file outside the checkout that applies to
+        # installs in every directory, and pass its location to later steps. The
+        # file holds the token, so it is readable by the owner only.
+        umask 077
+
+        # Keep settings the job already relies on.
+        if [ -n "${NPM_CONFIG_USERCONFIG:-}" ]; then
+          # Another step (for example actions/setup-node with registry-url) already
+          # chose the configuration file, so add to it.
+          NPMRC="${NPM_CONFIG_USERCONFIG}"
+          mkdir -p "$(dirname "$NPMRC")"
+          echo "::notice::Adding Takumi Guard settings to ${NPMRC}, which is already in use"
+        else
+          NPMRC="${RUNNER_TEMP}/.npmrc"
+          if [ ! -f "$NPMRC" ] && [ -f "${HOME}/.npmrc" ]; then
+            # Start from the contents of $HOME/.npmrc so its settings keep applying.
+            cp "${HOME}/.npmrc" "$NPMRC"
+            chmod 600 "$NPMRC"
+            echo "::notice::Seeded ${NPMRC} from ${HOME}/.npmrc so its settings keep applying"
+          fi
+          # Exported in every mode, including set-registry: false.
+          echo "NPM_CONFIG_USERCONFIG=${NPMRC}" >> "$GITHUB_ENV"
+        fi
+
         # Write to .npmrc directly instead of `npm config set` to avoid
         # `EBADDEVENGINES` failures when projects pin the package manager
         # via `devEngines.packageManager` (npm 10.9.0+). See issue #4.
         if [ "$SET_REGISTRY" != "false" ]; then
-          if [ -f .npmrc ]; then
-            grep -v '^registry=' .npmrc > .npmrc.tmp || true
-            mv .npmrc.tmp .npmrc
+          if [ -f "$NPMRC" ]; then
+            grep -v '^registry=' "$NPMRC" > "${NPMRC}.tmp" || true
+            mv "${NPMRC}.tmp" "$NPMRC"
           fi
-          echo "registry=${REGISTRY_URL}/" >> .npmrc
+          echo "registry=${REGISTRY_URL}/" >> "$NPMRC"
+          # The environment takes precedence over every .npmrc file, including one
+          # committed to the repository. Scoped registries still apply.
+          echo "NPM_CONFIG_REGISTRY=${REGISTRY_URL}/" >> "$GITHUB_ENV"
+          # The same registry setting for pnpm.
+          echo "pnpm_config_registry=${REGISTRY_URL}/" >> "$GITHUB_ENV"
           echo "YARN_NPM_REGISTRY_SERVER=${REGISTRY_URL}/" >> "$GITHUB_ENV"
-          echo "::notice::Registry set to ${REGISTRY_URL}"
+          echo "::notice::Registry set to ${REGISTRY_URL} (configuration at ${NPMRC})"
+        else
+          echo "::notice::Registry left to your own configuration; credentials go to ${NPMRC}"
         fi
 
     - name: Authenticate
@@ -75,7 +113,14 @@ runs:
         EXPIRES_IN: ${{ inputs.expires-in }}
         SET_REGISTRY: ${{ inputs.set-registry }}
         AUDIENCE_INPUT: ${{ inputs.audience }}
+        ALWAYS_AUTH: ${{ inputs.always-auth }}
       run: |
+        # The file holds the token, so it is readable by the owner only.
+        umask 077
+
+        # The configuration file chosen in the previous step.
+        NPMRC="${NPM_CONFIG_USERCONFIG:-${RUNNER_TEMP}/.npmrc}"
+
         # Anonymous mode — no bot-id provided
         if [ -z "$BOT_ID" ]; then
           echo "::notice::No bot-id provided — running in anonymous mode (Tier A blocking)"
@@ -151,12 +196,27 @@ runs:
         # Write to .npmrc directly instead of `npm config set` to avoid
         # `EBADDEVENGINES` failures when projects pin the package manager
         # via `devEngines.packageManager` (npm 10.9.0+). See issue #4.
-        if [ -f .npmrc ]; then
-          grep -v "^//${REGISTRY_HOST}/:_authToken=" .npmrc > .npmrc.tmp || true
-          mv .npmrc.tmp .npmrc
+        if [ -f "$NPMRC" ]; then
+          grep -v "^//${REGISTRY_HOST}/:_authToken=" "$NPMRC" > "${NPMRC}.tmp" || true
+          mv "${NPMRC}.tmp" "$NPMRC"
         fi
-        echo "//${REGISTRY_HOST}/:_authToken=${ACCESS_TOKEN}" >> .npmrc
+        echo "//${REGISTRY_HOST}/:_authToken=${ACCESS_TOKEN}" >> "$NPMRC"
+
+        # always-auth input: Yarn Classic also sends the token for unscoped
+        # packages. The entry names the registry host only.
+        if [ "$ALWAYS_AUTH" = "true" ]; then
+          grep -v "^//${REGISTRY_HOST}/:always-auth=" "$NPMRC" > "${NPMRC}.tmp" || true
+          mv "${NPMRC}.tmp" "$NPMRC"
+          echo "//${REGISTRY_HOST}/:always-auth=true" >> "$NPMRC"
+        fi
+
+        # Yarn Berry and bun take the token from these variables.
         echo "YARN_NPM_AUTH_TOKEN=${ACCESS_TOKEN}" >> "$GITHUB_ENV"
+        echo "BUN_CONFIG_TOKEN=${ACCESS_TOKEN}" >> "$GITHUB_ENV"
+
+        # Yarn Berry also sends the token for unscoped packages.
+        echo "YARN_NPM_ALWAYS_AUTH=true" >> "$GITHUB_ENV"
+
         echo "token=${ACCESS_TOKEN}" >> "$GITHUB_OUTPUT"
 
         # Calculate expiration timestamp (Linux date -d, macOS date -v fallback)
@@ -175,6 +235,7 @@ runs:
         EXPIRES_AT: ${{ steps.auth.outputs.expires_at }}
       run: |
         echo "registry-url=${REGISTRY_URL}" >> "$GITHUB_OUTPUT"
+        echo "npmrc-path=${NPM_CONFIG_USERCONFIG:-${RUNNER_TEMP}/.npmrc}" >> "$GITHUB_OUTPUT"
         if [ -n "$ACCESS_TOKEN" ]; then
           echo "::add-mask::${ACCESS_TOKEN}"
           echo "token=${ACCESS_TOKEN}" >> "$GITHUB_OUTPUT"
