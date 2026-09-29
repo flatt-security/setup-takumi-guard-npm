@@ -149,7 +149,7 @@ steps:
 
 **Key details:**
 - Auth is handled via **GitHub's built-in OIDC** -- no PATs or secrets to rotate.
-- If authentication fails, **blocking remains active** but logging is degraded. The build continues with a warning.
+- If authentication fails, **the action exits with an error**. To run without a bot, omit `bot-id` (see [Blocking only](#blocking-only)).
 - Every client receives the token. npm, pnpm, bun and Yarn Berry send it with every request to the proxy; **Yarn Classic sends it only for scoped packages by default**, so its unscoped packages are checked but not attributed. Set `always-auth: true` to attribute those too (see [Yarn Classic](#yarn-classic)), and see [Yarn Berry](#yarn-berry) for the one case where Berry needs a setting of your own.
 - Get a Bot ID from [Shisho Cloud byGMO](https://cloud.shisho.dev).
 
@@ -405,10 +405,12 @@ git commit -m "Route installs through Takumi Guard"
 
 | Error | Cause | Fix |
 |---|---|---|
-| `OIDC not available` | Missing permission on the job | Add `permissions: { id-token: write }` to your job |
+| `OIDC not available` | Missing permission on the job, or a pull request from a fork, which GitHub gives no OIDC token | Add `permissions: { id-token: write }` to your job. For pull requests from forks, skip the step or omit `bot-id` |
 | `invalid ID token` | Trust condition mismatch | Check the bot's trust settings in Shisho Cloud byGMO. If your trust condition sets an audience, it must equal the value the action sends -- by default the STS URL (`https://sts.cloud.shisho.dev`); use the `audience` input to override. |
 | `invalid request` | Malformed bot-id | Double-check the bot-id value from your console |
-| `Authentication failed ... Falling back` | STS token exchange failed | Verify bot-id and trust settings. Blocking is still active. |
+| `Authentication failed` | STS token exchange failed | Verify bot-id and trust settings |
+| `Could not reach the STS` | The runner could not connect to the STS | Check that the runner can reach the `sts-url` (default `https://sts.cloud.shisho.dev`), then re-run the job |
+| `STS returned non-JSON (HTTP N)` | The STS or a layer in front of it answered with something other than JSON, such as an HTML error page during an outage | Usually transient; re-run the job. The start of the response follows in the log as `sts body:` lines and shows what answered, which may be a proxy of your own |
 | Lockfile conflicts after setup | Lockfile still references `registry.npmjs.org` | Follow the [migration steps](#migrating-existing-projects) to regenerate it |
 
 > **Still stuck?** Open an issue on this repository with your error output and workflow file (redact any IDs).

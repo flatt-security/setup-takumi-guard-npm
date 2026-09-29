@@ -321,6 +321,163 @@ jobs:
           bun add left-pad@1.3.0 --no-cache --verbose > log.txt 2>&1 && { echo "::error::bun installed anonymously, so the token was not sent"; exit 1; }
           grep -q '^< 401' log.txt || { echo "::error::bun failed for a reason other than the proxy rejecting the token"; tail -20 log.txt; exit 1; }
 
+  transient-sts-error:
+    name: a transient STS error is retried
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      # The first exchange answers 502 with an HTML page; the retry succeeds.
+      - uses: ./
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080/flaky
+
+      - name: The token from the retried exchange is delivered
+        run: |
+          [ "${BUN_CONFIG_TOKEN:-}" = "standin-guard-token" ] || { echo "::error::the retried exchange did not issue the token"; exit 1; }
+
+  auth-failure:
+    name: authentication failure fails the step (${{ matrix.case }}, set-registry ${{ matrix.set-registry }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [no-oidc, oidc-unreachable, sts-rejects]
+        set-registry: ['true', 'false']
+        include:
+          - case: no-oidc
+            oidc-url: ''
+            sts-url: http://127.0.0.1:18080
+          # Nothing listens on port 9, so the OIDC request itself fails.
+          - case: oidc-unreachable
+            oidc-url: http://127.0.0.1:9/oidc
+            sts-url: http://127.0.0.1:18080
+          - case: sts-rejects
+            oidc-url: http://127.0.0.1:18080/oidc
+            sts-url: http://127.0.0.1:18080/reject
+    # No id-token permission, so the runner injects no OIDC endpoint of its own
+    # and an empty oidc-url leaves the action without one.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - uses: ./
+        id: guard
+        continue-on-error: true
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ matrix.oidc-url }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: ${{ matrix.sts-url }}
+          set-registry: ${{ matrix.set-registry }}
+
+      # A step that ends green here would leave every later install anonymous
+      # while the job reports success.
+      - name: The action failed and issued no token
+        env:
+          OUTCOME: ${{ steps.guard.outcome }}
+        run: |
+          [ "$OUTCOME" = "failure" ] || { echo "::error::the action ended with '${OUTCOME}' although authentication failed"; exit 1; }
+          [ -n "${NPM_CONFIG_USERCONFIG:-}" ] || { echo "::error::the action failed before it reached authentication"; exit 1; }
+          if grep -q ':_authToken=' "$NPM_CONFIG_USERCONFIG" 2>/dev/null || [ -n "${YARN_NPM_AUTH_TOKEN:-}${BUN_CONFIG_TOKEN:-}" ]; then echo "::error::a token was issued although authentication failed"; exit 1; fi
+
+  auth-failure-message:
+    name: authentication failure names its cause (${{ matrix.case }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: no-oidc
+            oidc-url: ''
+            sts-url: http://127.0.0.1:18080
+            error: "OIDC not available. Add 'permissions: { id-token: write }' to your job."
+          - case: oidc-unreachable
+            oidc-url: http://127.0.0.1:9/oidc
+            sts-url: http://127.0.0.1:18080
+            error: Failed to get OIDC token.
+          - case: sts-rejects
+            oidc-url: http://127.0.0.1:18080/oidc
+            sts-url: http://127.0.0.1:18080/reject
+            error: 'Authentication failed: invalid ID token'
+          # Nothing listens on port 9, so the exchange never reaches an STS.
+          - case: sts-unreachable
+            oidc-url: http://127.0.0.1:18080/oidc
+            sts-url: http://127.0.0.1:9
+            error: Could not reach the STS at http://127.0.0.1:9.
+          - case: sts-non-json
+            oidc-url: http://127.0.0.1:18080/oidc
+            sts-url: http://127.0.0.1:18080/html
+            error: STS returned non-JSON (HTTP 502). Usually indicates an outage upstream of STS.
+            log: 'sts body: <html><body>502 Bad Gateway</body></html>'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      # No later step sees what a composite action printed, so the Authenticate
+      # script is taken out of action.yml and run with the shell options the
+      # runner uses for it, to read the error it prints.
+      - name: Authenticate exits 1 and names the cause
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ matrix.oidc-url }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+          BOT_ID: standin-bot
+          STS_URL: ${{ matrix.sts-url }}
+          REGISTRY_URL: https://npm.flatt.tech
+          EXPIRES_IN: '1800'
+          EXPECTED: ${{ matrix.error }}
+          EXPECTED_LOG: ${{ matrix.log }}
+        run: |
+          python3 - <<'EOF'
+          lines = open('action.yml').read().split('\n')
+          start = next(i for i, l in enumerate(lines) if l.strip() == '- name: Authenticate')
+          run = next(i for i in range(start, len(lines)) if lines[i].strip() == 'run: |')
+          indent = len(lines[run]) - len(lines[run].lstrip())
+          body = []
+          for l in lines[run + 1:]:
+              if l.strip() and len(l) - len(l.lstrip()) <= indent:
+                  break
+              body.append(l[indent + 2:])
+          open('authenticate.sh', 'w').write('\n'.join(body) + '\n')
+          EOF
+          status=0
+          bash --noprofile --norc -e -o pipefail authenticate.sh > out.txt 2>&1 || status=$?
+          sed 's/^/  | /' out.txt
+          [ "$status" = 1 ] || { echo "::error::Authenticate exited ${status}, not 1"; exit 1; }
+          grep -qxF "::error::${EXPECTED}" out.txt || { echo "::error::Authenticate did not print '${EXPECTED}'"; exit 1; }
+          [ "$(grep -c '^::error::' out.txt)" = 1 ] || { echo "::error::Authenticate printed more than one error annotation"; exit 1; }
+          [ -z "$EXPECTED_LOG" ] || grep -qxF "$EXPECTED_LOG" out.txt || { echo "::error::Authenticate did not print '${EXPECTED_LOG}'"; exit 1; }
+          # Every line of the STS answer is printed while workflow commands are
+          # stopped, and they are resumed afterwards.
+          awk '/^::stop-commands::/ { t = substr($0, 18); next }
+               t != "" && $0 == "::" t "::" { t = ""; next }
+               /^sts body: / && t == "" { bad = 1 }
+               END { if (bad || t != "") exit 1 }' out.txt || { echo "::error::the STS answer was printed while workflow commands were active"; exit 1; }
+
   auth-only-mode:
     name: set-registry false still delivers the file location
     runs-on: ubuntu-latest
