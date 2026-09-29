@@ -405,7 +405,7 @@ git commit -m "Route installs through Takumi Guard"
 
 | Error | Cause | Fix |
 |---|---|---|
-| `OIDC not available` | Missing permission on the job | Add `permissions: { id-token: write }` to your job |
+| `OIDC not available` | Missing permission on the job, or a pull request from a fork, which GitHub gives no OIDC token | Add `permissions: { id-token: write }` to your job. For pull requests from forks, skip the step or omit `bot-id` |
 | `invalid ID token` | Trust condition mismatch | Check the bot's trust settings in Shisho Cloud byGMO. If your trust condition sets an audience, it must equal the value the action sends -- by default the STS URL (`https://sts.cloud.shisho.dev`); use the `audience` input to override. |
 | `invalid request` | Malformed bot-id | Double-check the bot-id value from your console |
 | `Authentication failed` | STS token exchange failed | Verify bot-id and trust settings |
